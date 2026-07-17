@@ -1,44 +1,31 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-import sqlite3
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="Moulin d'Aita - Traçabilité", page_icon="🌾", layout="wide")
 
-# --- CONNEXION BASE DE DONNÉES (SQLite) ---
-conn = sqlite3.connect("tracabilite_moulin.db", check_same_thread=False)
-cursor = conn.cursor()
+st.title("🌽 Système de Traçabilité - Moulin d'Aita")
+st.markdown("---")
 
-# Création des tables si elles n'existent pas
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS moulin (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    produit TEXT,
-    lot TEXT,
-    quantite REAL
-)
-""")
+# --- CONNEXION GOOGLE SHEETS ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS production_talos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    lot_talos TEXT,
-    lot_farine TEXT,
-    lot_mix TEXT,
-    quantite_talos INTEGER
-)
-""")
-conn.commit()
+# Fonction pour charger les données proprement
+def charger_onglet(nom_onglet, colonnes_defaut):
+    try:
+        df = conn.read(worksheet=nom_onglet, ttl=0)
+        df = df.dropna(how='all') # Nettoie les lignes vides
+        if df.empty:
+            return pd.DataFrame(columns=colonnes_defaut)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=colonnes_defaut)
 
-# Sécurité : Ajout de la colonne lot_talos si le fichier existait déjà avant
-try:
-    cursor.execute("ALTER TABLE production_talos ADD COLUMN lot_talos TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
+# Chargement des données en temps réel
+df_moulin = charger_onglet("1 moulin", ["Date", "Produit", "N° Lot", "Quantité (kg)"])
+df_talos = charger_onglet("2_Production_Talos", ["Date Fab.", "N° Lot / DLC", "Lot Farine", "Lot Mix", "Quantité"])
 
 # --- FONCTION : GÉNÉRATION DU LOT MOULIN ---
 def generer_numero_lot_moulin(date_obj, produit):
@@ -48,10 +35,6 @@ def generer_numero_lot_moulin(date_obj, produit):
     annee_deux_chiffres = str(date_obj.year)[-2:]
     semaine = date_obj.isocalendar()[1]
     return f"{premiere_lettre}{annee_deux_chiffres}{semaine:02d}"
-
-# --- INTERFACE STREAMLIT ---
-st.title("🌽 Système de Traçabilité - Moulin d'Aita")
-st.markdown("---")
 
 # Navigation latérale
 navigation = st.sidebar.radio("Navigation", ["🌾 1. Moulin (Moutures)", "🥞 2. Production Talos", "🔍 3. Moteur de Recherche"])
@@ -74,36 +57,35 @@ if navigation == "🌾 1. Moulin (Moutures)":
         lot_calcule = generer_numero_lot_moulin(date_moulin, produit)
         st.info(f"**Numéro de lot qui sera généré automatiquement :** {lot_calcule}")
         
-        soumettre = st.form_submit_button("Enregistrer la mouture")
+        soumettre = st.form_submit_button("Enregistrer la mouture dans Google Sheets")
         
         if soumettre:
-            cursor.execute(
-                "INSERT INTO moulin (date, produit, lot, quantite) VALUES (?, ?, ?, ?)",
-                (date_moulin.strftime("%Y-%m-%d"), produit, lot_calcule, quantite)
-            )
-            conn.commit()
+            nouvelle_ligne = pd.DataFrame([{
+                "Date": date_moulin.strftime("%Y-%m-%d"),
+                "Produit": produit,
+                "N° Lot": str(lot_calcule),
+                "Quantité (kg)": quantite
+            }])
+            df_moulin = pd.concat([df_moulin, nouvelle_ligne], ignore_index=True)
+            conn.update(worksheet="1 moulin", data=df_moulin)
             st.success(f"Lot {lot_calcule} enregistré avec succès !")
             st.rerun()
 
     st.markdown("---")
     st.subheader("Historique des Moutures")
-    df_moulin = pd.read_sql_query("SELECT date as Date, produit as Produit, lot as [N° Lot], quantite as [Quantité (kg)] FROM moulin ORDER BY id DESC", conn)
     st.dataframe(df_moulin, use_container_width=True)
 
-    # --- AJOUT : BOUTON SUPPRIMER LOT MOULIN ---
     if not df_moulin.empty:
         with st.expander("⚠️ Supprimer un lot de mouture par erreur"):
-            liste_lots_moulin = df_moulin["N° Lot"].unique().tolist()
-            lot_a_supprimer = st.selectbox("Sélectionner le lot à effacer définitivement :", ["-- Choisir --"] + liste_lots_moulin, key="del_moulin_select")
+            liste_lots_moulin = df_moulin["N° Lot"].dropna().unique().tolist()
+            lot_a_supprimer = st.selectbox("Sélectionner le lot à effacer :", ["-- Choisir --"] + liste_lots_moulin)
             
-            if st.button("🗑️ Supprimer ce lot du Moulin", type="primary", key="btn_del_moulin"):
+            if st.button("🗑️ Supprimer ce lot du Moulin", type="primary"):
                 if lot_a_supprimer != "-- Choisir --":
-                    cursor.execute("DELETE FROM moulin WHERE lot = ?", (lot_a_supprimer,))
-                    conn.commit()
-                    st.success(f"Le lot {lot_a_supprimer} a bien été supprimé de la base de données.")
+                    df_moulin = df_moulin[df_moulin["N° Lot"] != lot_a_supprimer]
+                    conn.update(worksheet="1 moulin", data=df_moulin)
+                    st.success(f"Le lot {lot_a_supprimer} a été supprimé.")
                     st.rerun()
-                else:
-                    st.warning("Veuillez sélectionner un lot valide.")
 
 # -----------------------------------------------------------------
 # PAGE 2 : PRODUCTION TALOS
@@ -111,9 +93,8 @@ if navigation == "🌾 1. Moulin (Moutures)":
 elif navigation == "🥞 2. Production Talos":
     st.header("Enregistrement de la Production de Talos")
     
-    df_lots = pd.read_sql_query("SELECT lot, produit FROM moulin", conn)
-    lots_farine = df_lots[df_lots['produit'] == 'Farine']['lot'].tolist()
-    lots_mix = df_lots[df_lots['produit'] == 'Mix']['lot'].tolist()
+    lots_farine = df_moulin[df_moulin['Produit'] == 'Farine']['N° Lot'].dropna().unique().tolist()
+    lots_mix = df_moulin[df_moulin['Produit'] == 'Mix']['N° Lot'].dropna().unique().tolist()
     
     with st.form("form_talos", clear_on_submit=True):
         col1, col2 = st.columns(2)
@@ -126,45 +107,42 @@ elif navigation == "🥞 2. Production Talos":
             
         date_dlc = date_talos + timedelta(weeks=3)
         lot_talos_genere = date_dlc.strftime("%d/%m/%Y")
+        st.warning(f"📅 **N° de Lot créé automatiquement (DLC) :** {lot_talos_genere}")
         
-        st.warning(f"📅 **N° de Lot créé automatiquement (DLC à +3 semaines) :** {lot_talos_genere}")
-        
-        soumettre_talos = st.form_submit_button("Enregistrer la fournée")
+        soumettre_talos = st.form_submit_button("Enregistrer la fournée dans Google Sheets")
         
         if soumettre_talos:
             if not lot_f_choisi:
                 st.error("Tu dois obligatoirement sélectionner un lot de farine.")
             else:
-                cursor.execute(
-                    "INSERT INTO production_talos (date, lot_talos, lot_farine, lot_mix, quantite_talos) VALUES (?, ?, ?, ?, ?)",
-                    (date_talos.strftime("%Y-%m-%d"), lot_talos_genere, lot_f_choisi, lot_m_choisi, quantite_talos)
-                )
-                conn.commit()
-                st.success(f"Fournée de Talos enregistrée ! Lot/DLC : {lot_talos_genere}")
+                nouvelle_fournee = pd.DataFrame([{
+                    "Date Fab.": date_talos.strftime("%Y-%m-%d"),
+                    "N° Lot / DLC": str(lot_talos_genere),
+                    "Lot Farine": str(lot_f_choisi),
+                    "Lot Mix": str(lot_m_choisi),
+                    "Quantité": int(quantite_talos)
+                }])
+                df_talos = pd.concat([df_talos, nouvelle_fournee], ignore_index=True)
+                conn.update(worksheet="2_Production_Talos", data=df_talos)
+                st.success(f"Fournée enregistrée !")
                 st.rerun()
 
     st.markdown("---")
     st.subheader("Historique de Fabrication des Talos")
-    df_talos = pd.read_sql_query("SELECT id, date as [Date Fab.], lot_talos as [N° Lot / DLC], lot_farine as [Lot Farine], lot_mix as [Lot Mix], quantite_talos as [Quantité] FROM production_talos ORDER BY id DESC", conn)
-    # On affiche le tableau sans la colonne ID technique pour l'utilisateur
-    st.dataframe(df_talos.drop(columns=["id"]), use_container_width=True)
+    st.dataframe(df_talos, use_container_width=True)
 
-    # --- AJOUT : BOUTON SUPPRIMER FOURNÉE TALOS ---
     if not df_talos.empty:
         with st.expander("⚠️ Supprimer une fournée de Talos par erreur"):
-            # On crée un affichage lisible "ID - Date - DLC" pour être sûr de supprimer la bonne ligne s'il y a des doublons de DLC
-            options_suppr = {f"Option {row['id']} : Fait le {row['Date Fab.']} (DLC: {row['N° Lot / DLC']})": row['id'] for _, row in df_talos.iterrows()}
-            choix_fournee = st.selectbox("Sélectionner la fournée à effacer définitivement :", ["-- Choisir --"] + list(options_suppr.keys()), key="del_talos_select")
+            options_suppr = {f"Ligne {i} : Fait le {row['Date Fab.']} (DLC: {row['N° Lot / DLC']})": i for i, row in df_talos.iterrows()}
+            choix_fournee = st.selectbox("Sélectionner la fournée à effacer :", ["-- Choisir --"] + list(options_suppr.keys()))
             
-            if st.button("🗑️ Supprimer cette fournée de Talos", type="primary", key="btn_del_talos"):
+            if st.button("🗑️ Supprimer cette fournée de Talos", type="primary"):
                 if choix_fournee != "-- Choisir --":
-                    id_a_supprimer = options_suppr[choix_fournee]
-                    cursor.execute("DELETE FROM production_talos WHERE id = ?", (id_a_supprimer,))
-                    conn.commit()
-                    st.success("La fournée a bien été supprimée de la base de données.")
+                    index_a_supprimer = options_suppr[choix_fournee]
+                    df_talos = df_talos.drop(index_a_supprimer)
+                    conn.update(worksheet="2_Production_Talos", data=df_talos)
+                    st.success("La fournée a bien été supprimée.")
                     st.rerun()
-                else:
-                    st.warning("Veuillez sélectionner une fournée valide.")
 
 # -----------------------------------------------------------------
 # PAGE 3 : MOTEUR DE RECHERCHE
@@ -172,54 +150,52 @@ elif navigation == "🥞 2. Production Talos":
 elif navigation == "🔍 3. Moteur de Recherche":
     st.header("Moteur de Recherche & Généalogie des Lots")
     
-    df_t_lots = pd.read_sql_query("SELECT DISTINCT lot_talos FROM production_talos WHERE lot_talos IS NOT NULL AND lot_talos != ''", conn)
-    liste_lots_talos = df_t_lots['lot_talos'].tolist()
-    
+    liste_lots_talos = df_talos['N° Lot / DLC'].dropna().unique().tolist()
     recherche = st.selectbox("Sélectionner le N° de lot (DLC) du Talo à tracer :", ["-- Choisir un lot --"] + liste_lots_talos)
     
     if recherche and recherche != "-- Choisir un lot --":
         st.markdown(f"### 🧬 Arbre Généalogique du Lot Talos : `{recherche}`")
         
-        df_talos_trouve = pd.read_sql_query("SELECT * FROM production_talos WHERE lot_talos = ?", conn, params=(recherche,))
+        df_talos_trouve = df_talos[df_talos['N° Lot / DLC'] == recherche]
         
         if not df_talos_trouve.empty:
             row_t = df_talos_trouve.iloc[0]
             
             st.success(f"""
             **🥞 Étape 1 : Produit Fini (Talos)**
-            *   **Date de Fabrication :** {row_t['date']}
-            *   **Date Limite de Consommation (Lot) :** {row_t['lot_talos']}
-            *   **Quantité fabriquée :** {row_t['quantite_talos']} pièces
+            *   **Date de Fabrication :** {row_t['Date Fab.']}
+            *   **Date Limite de Consommation (Lot) :** {row_t['N° Lot / DLC']}
+            *   **Quantité fabriquée :** {row_t['Quantité']} pièces
             """)
             
-            lot_f = row_t['lot_farine']
-            lot_m = row_t['lot_mix']
+            lot_f = row_t['Lot Farine']
+            lot_mix = row_t['Lot Mix']
             
             st.write("#### ⬇️ Remontée vers les Matières Premières (Moulin) :")
             col_f, col_m = st.columns(2)
             
             with col_f:
                 if lot_f:
-                    df_f_moulin = pd.read_sql_query("SELECT * FROM moulin WHERE lot = ?", conn, params=(lot_f,))
+                    df_f_moulin = df_moulin[df_moulin['N° Lot'] == lot_f]
                     if not df_f_moulin.empty:
                         st.info(f"""
                         **🌾 Origine de la Farine**
                         *   **N° Lot utilisé :** `{lot_f}`
-                        *   **Date de mouture :** {df_f_moulin.iloc[0]['date']}
-                        *   **Quantité moulue ce jour-là :** {df_f_moulin.iloc[0]['quantite']} kg
+                        *   **Date de mouture :** {df_f_moulin.iloc[0]['Date']}
+                        *   **Quantité moulue ce jour-là :** {df_f_moulin.iloc[0]['Quantité (kg)']} kg
                         """)
                     else:
                         st.error(f"❌ Le lot de farine `{lot_f}` est introuvable au moulin.")
             
             with col_m:
-                if lot_m:
-                    df_m_moulin = pd.read_sql_query("SELECT * FROM moulin WHERE lot = ?", conn, params=(lot_m,))
+                if lot_m and str(lot_m) != "nan" and lot_m != "":
+                    df_m_moulin = df_moulin[df_moulin['N° Lot'] == lot_m]
                     if not df_m_moulin.empty:
                         st.info(f"""
                         **🥣 Origine du Mix**
                         *   **N° Lot utilisé :** `{lot_m}`
-                        *   **Date de mouture :** {df_m_moulin.iloc[0]['date']}
-                        *   **Quantité moulue ce jour-là :** {df_m_moulin.iloc[0]['quantite']} kg
+                        *   **Date de mouture :** {df_m_moulin.iloc[0]['Date']}
+                        *   **Quantité moulue ce jour-là :** {df_m_moulin.iloc[0]['Quantité (kg)']} kg
                         """)
                     else:
                         st.error(f"❌ Le lot de mix `{lot_m}` est introuvable au moulin.")
