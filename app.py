@@ -169,13 +169,13 @@ elif navigation == "🔍 3. Moteur de Recherche":
             """)
             
             lot_f = row_t['Lot Farine']
-            lot_mix = row_t['Lot Mix']
+            lot_m = row_t['Lot Mix'] # --- CORRECTION ICI (Nom de variable uniformisé) ---
             
             st.write("#### ⬇️ Remontée vers les Matières Premières (Moulin) :")
             col_f, col_m = st.columns(2)
             
             with col_f:
-                if lot_f:
+                if lot_f and str(lot_f) != "nan" and lot_f != "":
                     df_f_moulin = df_moulin[df_moulin['N° Lot'] == lot_f]
                     if not df_f_moulin.empty:
                         st.info(f"""
